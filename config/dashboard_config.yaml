@@ -1,0 +1,77 @@
+# Dashboard Configuration
+
+# Database settings
+database:
+  type: sqlite  # Options: sqlite, postgresql
+  sqlite_path: "data/search_metrics.db"
+  # Uncomment for PostgreSQL configuration
+  # postgresql:
+  #   host: localhost
+  #   port: 5432
+  #   dbname: search_metrics
+  #   user: username
+  #   password: password
+
+# Data processing settings
+data_processing:
+  sample_rate: 1.0  # Set to < 1.0 for downsampling
+  session_timeout: 1800  # Session timeout in seconds (30 minutes)
+  min_session_length: 2  # Minimum number of queries per session
+  max_session_length: 50  # Cap on queries per session for outlier handling
+
+# Metrics settings
+metrics:
+  # Click-based metrics
+  ctr:
+    enabled: true
+    timeout: 300  # Maximum time in seconds to consider a click relevant (5 minutes)
+  
+  # Time-based metrics
+  time_to_click:
+    enabled: true
+    max_time: 600  # Maximum time to consider (10 minutes)
+    outlier_threshold: 0.95  # Percentile threshold for outlier removal
+  
+  # Relevance metrics
+  ndcg:
+    enabled: true
+    k_values: [3, 5, 10]  # Calculate NDCG@k for these values
+  
+  mrr:
+    enabled: true
+    consider_no_clicks: true  # Whether to include queries with no clicks (as 0)
+  
+  # Query reformulation metrics
+  reformulation:
+    enabled: true
+    max_time_between_queries: 600  # Maximum time between queries to be considered related (10 minutes)
+    similarity_threshold: 0.7  # Threshold for considering queries as similar (for fuzzy matching)
+
+# Visualization settings
+visualization:
+  theme: "light"  # Options: light, dark
+  default_time_range: "7d"  # Options: 1d, 7d, 30d, 90d, custom
+  chart_height: 400  # Default chart height in pixels
+  refresh_interval: 3600  # Dashboard auto-refresh interval in seconds (1 hour)
+  
+  # Time granularity options for aggregations
+  time_granularity_options:
+    - hour
+    - day
+    - week
+    - month
+  
+  # Default segments for breakdown analysis
+  default_segments:
+    - device_type
+    - query_type
+    - user_type
+    - location
+
+# Logging configuration
+logging:
+  level: "INFO"  # Options: DEBUG, INFO, WARNING, ERROR
+  file: "logs/dashboard.log"
+  rotate: true
+  max_size_mb: 10
+  backup_count: 5
