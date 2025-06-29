@@ -1,564 +1,434 @@
-"""
-Engagement Metrics for Search Quality Dashboard.
-
-This module calculates engagement metrics from search log data, including:
-- Click-Through Rate (CTR)
-- Zero-Click Rate
-- Time to First Click
-- Query Reformulation Rate
-- Session Abandonment Rate
-"""
-
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Tuple, Any, Optional
-import logging
+from typing import Dict, List, Tuple, Optional
 from datetime import datetime, timedelta
-import json
-from scipy import stats
-
-# Set up logging
-logger = logging.getLogger(__name__)
 
 class EngagementMetrics:
-    """Calculate engagement metrics from search log data."""
+    """
+    Calculate user engagement metrics for search quality analysis.
     
-    def __init__(self, config: Dict = None):
-        """Initialize with configuration."""
-        self.config = config or {}
-        self.metrics_config = self.config.get('metrics', {})
-        
-        # Configure time-to-click settings
-        ttc_config = self.metrics_config.get('time_to_click', {})
-        self.max_time_to_click = ttc_config.get('max_time', 600)  # 10 minutes by default
-        self.ttc_outlier_threshold = ttc_config.get('outlier_threshold', 0.95)
-        
-        # Configure session timeout
-        self.session_timeout = self.config.get('session_timeout', 1800)  # 30 minutes by default
-        
-    def calculate_ctr(self, df: pd.DataFrame) -> Dict[str, Any]:
+    This class provides methods to compute various engagement metrics
+    that indicate how users interact with search results, including
+    click-through rates, time spent, and behavioral patterns.
+    """
+    
+    def __init__(self, data: pd.DataFrame):
         """
-        Calculate Click-Through Rate (CTR) metrics.
+        Initialize with search event data.
         
         Args:
-            df: DataFrame containing search log data with at least 'query_id' and 'clicked_results' columns
+            data: DataFrame containing search events with required columns:
+                  - session_id, user_id, timestamp, event_type, query, etc.
+        """
+        self.data = data.copy()
+        self.search_events = data[data['event_type'] == 'search'].copy()
+        self.click_events = data[data['event_type'] == 'click'].copy()
+    
+    def calculate_click_through_rate(self, 
+                                   groupby_cols: Optional[List[str]] = None,
+                                   time_period: str = 'daily') -> pd.DataFrame:
+        """
+        Calculate click-through rate (CTR) - percentage of searches that result in clicks.
+        
+        Args:
+            groupby_cols: Additional columns to group by (e.g., ['user_segment', 'device_type'])
+            time_period: Time aggregation period ('daily', 'weekly', 'monthly')
             
         Returns:
-            Dictionary of CTR metrics
+            DataFrame with CTR metrics
         """
-        logger.info("Calculating CTR metrics")
+        # Add time period column
+        self.search_events['period'] = self._get_time_period(
+            self.search_events['timestamp'], time_period
+        )
+        self.click_events['period'] = self._get_time_period(
+            self.click_events['timestamp'], time_period
+        )
         
-        # Ensure 'clicked_results' is parsed from JSON if necessary
-        if df['clicked_results'].dtype == 'object' and isinstance(df['clicked_results'].iloc[0], str):
-            df['clicked_results'] = df['clicked_results'].apply(json.loads)
+        base_groups = ['period']
+        if groupby_cols:
+            base_groups.extend(groupby_cols)
         
-        # Add flag for queries with clicks
-        df['has_clicks'] = df['clicked_results'].apply(lambda x: len(x) > 0 if isinstance(x, list) else False)
+        # Count total searches
+        search_counts = self.search_events.groupby(base_groups).size().reset_index(name='total_searches')
+        
+        # Count searches with clicks
+        searches_with_clicks = self.click_events.groupby(
+            base_groups + ['session_id', 'query_index_in_session']
+        ).size().reset_index(name='click_count')
+        
+        clicks_per_period = searches_with_clicks.groupby(base_groups).size().reset_index(name='searches_with_clicks')
+        
+        # Merge and calculate CTR
+        ctr_data = search_counts.merge(clicks_per_period, on=base_groups, how='left').fillna(0)
+        ctr_data['click_through_rate'] = ctr_data['searches_with_clicks'] / ctr_data['total_searches']
+        ctr_data['ctr_percentage'] = ctr_data['click_through_rate'] * 100
+        
+        return ctr_data
+    
+    def calculate_time_to_click(self, 
+                              groupby_cols: Optional[List[str]] = None,
+                              time_period: str = 'daily') -> pd.DataFrame:
+        """
+        Calculate average time from search to first click.
+        
+        Args:
+            groupby_cols: Additional columns to group by
+            time_period: Time aggregation period
+            
+        Returns:
+            DataFrame with time to click metrics
+        """
+        # Merge search and click events
+        merged_data = self.search_events.merge(
+            self.click_events,
+            on=['session_id', 'query_index_in_session'],
+            suffixes=('_search', '_click')
+        )
+        
+        # Calculate time to click
+        merged_data['time_to_click'] = (
+            merged_data['timestamp_click'] - merged_data['timestamp_search']
+        ).dt.total_seconds()
+        
+        # Add time period
+        merged_data['period'] = self._get_time_period(
+            merged_data['timestamp_search'], time_period
+        )
+        
+        # Group and aggregate
+        base_groups = ['period']
+        if groupby_cols:
+            base_groups.extend([f"{col}_search" for col in groupby_cols])
+        
+        ttc_metrics = merged_data.groupby(base_groups).agg({
+            'time_to_click': ['mean', 'median', 'std', 'count'],
+            'session_id': 'nunique'
+        }).round(2)
+        
+        # Flatten column names
+        ttc_metrics.columns = [
+            'avg_time_to_click_seconds', 'median_time_to_click_seconds',
+            'std_time_to_click_seconds', 'total_clicks', 'unique_sessions'
+        ]
+        
+        return ttc_metrics.reset_index()
+    
+    def calculate_session_engagement(self, 
+                                   time_period: str = 'daily') -> pd.DataFrame:
+        """
+        Calculate session-level engagement metrics.
+        
+        Args:
+            time_period: Time aggregation period
+            
+        Returns:
+            DataFrame with session engagement metrics
+        """
+        # Calculate session metrics
+        session_metrics = []
+        
+        for session_id, session_data in self.search_events.groupby('session_id'):
+            session_clicks = self.click_events[
+                self.click_events['session_id'] == session_id
+            ]
+            
+            # Basic session info
+            session_start = session_data['timestamp'].min()
+            session_end = session_data['timestamp'].max()
+            session_duration = (session_end - session_start).total_seconds()
+            
+            # Engagement metrics
+            num_queries = len(session_data)
+            num_clicks = len(session_clicks)
+            unique_queries = session_data['query'].nunique()
+            
+            # Calculate reformulation rate
+            reformulation_rate = (num_queries - unique_queries) / num_queries if num_queries > 0 else 0
+            
+            # Session engagement score (composite metric)
+            engagement_score = self._calculate_session_engagement_score(
+                num_queries, num_clicks, session_duration, reformulation_rate
+            )
+            
+            session_metrics.append({
+                'session_id': session_id,
+                'user_id': session_data['user_id'].iloc[0],
+                'user_segment': session_data['user_segment'].iloc[0],
+                'device_type': session_data['device_type'].iloc[0],
+                'period': self._get_time_period(pd.Series([session_start]), time_period)[0],
+                'session_duration_seconds': session_duration,
+                'num_queries': num_queries,
+                'num_clicks': num_clicks,
+                'unique_queries': unique_queries,
+                'reformulation_rate': reformulation_rate,
+                'engagement_score': engagement_score
+            })
+        
+        return pd.DataFrame(session_metrics)
+    
+    def calculate_click_position_metrics(self, 
+                                       groupby_cols: Optional[List[str]] = None,
+                                       time_period: str = 'daily') -> pd.DataFrame:
+        """
+        Calculate metrics related to click positions in search results.
+        
+        Args:
+            groupby_cols: Additional columns to group by
+            time_period: Time aggregation period
+            
+        Returns:
+            DataFrame with click position metrics
+        """
+        if self.click_events.empty:
+            return pd.DataFrame()
+        
+        # Add time period
+        self.click_events['period'] = self._get_time_period(
+            self.click_events['timestamp'], time_period
+        )
+        
+        base_groups = ['period']
+        if groupby_cols:
+            base_groups.extend(groupby_cols)
+        
+        # Calculate position metrics
+        position_metrics = self.click_events.groupby(base_groups).agg({
+            'click_position': ['mean', 'median', 'std'],
+            'session_id': 'count'
+        }).round(2)
+        
+        # Flatten column names
+        position_metrics.columns = [
+            'avg_click_position', 'median_click_position', 
+            'std_click_position', 'total_clicks'
+        ]
+        
+        # Calculate percentage of clicks in top positions
+        for top_n in [1, 3, 5]:
+            top_clicks = self.click_events[
+                self.click_events['click_position'] <= top_n
+            ].groupby(base_groups).size()
+            
+            total_clicks = self.click_events.groupby(base_groups).size()
+            top_percentage = (top_clicks / total_clicks * 100).fillna(0)
+            position_metrics[f'top_{top_n}_click_percentage'] = top_percentage
+        
+        return position_metrics.reset_index()
+    
+    def calculate_result_engagement(self, 
+                                  time_period: str = 'daily') -> pd.DataFrame:
+        """
+        Calculate engagement metrics for search results.
+        
+        Args:
+            time_period: Time aggregation period
+            
+        Returns:
+            DataFrame with result engagement metrics
+        """
+        if self.click_events.empty:
+            return pd.DataFrame()
+        
+        # Add time period
+        self.click_events['period'] = self._get_time_period(
+            self.click_events['timestamp'], time_period
+        )
+        
+        # Calculate result engagement metrics
+        result_metrics = self.click_events.groupby(['period', 'result_type']).agg({
+            'time_on_result_seconds': ['mean', 'median', 'std'],
+            'is_satisfied': 'mean',
+            'session_id': 'count'
+        }).round(2)
+        
+        # Flatten column names
+        result_metrics.columns = [
+            'avg_time_on_result', 'median_time_on_result', 
+            'std_time_on_result', 'satisfaction_rate', 'total_clicks'
+        ]
+        
+        return result_metrics.reset_index()
+    
+    def calculate_user_engagement_segments(self) -> pd.DataFrame:
+        """
+        Segment users based on their engagement patterns.
+        
+        Returns:
+            DataFrame with user engagement segments
+        """
+        # Calculate user-level metrics
+        user_metrics = []
+        
+        for user_id, user_data in self.search_events.groupby('user_id'):
+            user_clicks = self.click_events[
+                self.click_events['user_id'] == user_id
+            ]
+            
+            # Calculate engagement metrics
+            total_searches = len(user_data)
+            total_clicks = len(user_clicks)
+            unique_sessions = user_data['session_id'].nunique()
+            avg_session_duration = user_data.groupby('session_id')['timestamp'].apply(
+                lambda x: (x.max() - x.min()).total_seconds()
+            ).mean()
+            
+            # Calculate satisfaction rate
+            satisfaction_rate = user_clicks['is_satisfied'].mean() if not user_clicks.empty else 0
+            
+            user_metrics.append({
+                'user_id': user_id,
+                'user_segment': user_data['user_segment'].iloc[0],
+                'total_searches': total_searches,
+                'total_clicks': total_clicks,
+                'unique_sessions': unique_sessions,
+                'click_through_rate': total_clicks / total_searches if total_searches > 0 else 0,
+                'avg_session_duration': avg_session_duration,
+                'satisfaction_rate': satisfaction_rate
+            })
+        
+        user_df = pd.DataFrame(user_metrics)
+        
+        # Define engagement segments based on behavior
+        def classify_engagement(row):
+            if row['click_through_rate'] >= 0.7 and row['satisfaction_rate'] >= 0.6:
+                return 'highly_engaged'
+            elif row['click_through_rate'] >= 0.4 and row['satisfaction_rate'] >= 0.3:
+                return 'moderately_engaged'
+            elif row['click_through_rate'] >= 0.1:
+                return 'low_engaged'
+            else:
+                return 'disengaged'
+        
+        user_df['engagement_segment'] = user_df.apply(classify_engagement, axis=1)
+        
+        return user_df
+    
+    def _calculate_session_engagement_score(self, 
+                                          num_queries: int, 
+                                          num_clicks: int,
+                                          session_duration: float, 
+                                          reformulation_rate: float) -> float:
+        """
+        Calculate a composite engagement score for a session.
+        
+        Args:
+            num_queries: Number of queries in the session
+            num_clicks: Number of clicks in the session
+            session_duration: Duration of the session in seconds
+            reformulation_rate: Rate of query reformulation
+            
+        Returns:
+            Engagement score between 0 and 1
+        """
+        # Normalize factors
+        query_score = min(num_queries / 5, 1.0)  # Normalize to max 5 queries
+        click_score = min(num_clicks / 10, 1.0)  # Normalize to max 10 clicks
+        duration_score = min(session_duration / 300, 1.0)  # Normalize to max 5 minutes
+        reformulation_penalty = max(0, 1 - reformulation_rate)  # Penalty for too much reformulation
+        
+        # Weighted combination
+        engagement_score = (
+            query_score * 0.2 +
+            click_score * 0.4 +
+            duration_score * 0.3 +
+            reformulation_penalty * 0.1
+        )
+        
+        return round(engagement_score, 3)
+    
+    def _get_time_period(self, timestamps: pd.Series, period: str) -> pd.Series:
+        """
+        Convert timestamps to time period labels.
+        
+        Args:
+            timestamps: Series of timestamps
+            period: Time period ('daily', 'weekly', 'monthly')
+            
+        Returns:
+            Series with period labels
+        """
+        if period == 'daily':
+            return timestamps.dt.date
+        elif period == 'weekly':
+            return timestamps.dt.to_period('W').astype(str)
+        elif period == 'monthly':
+            return timestamps.dt.to_period('M').astype(str)
+        else:
+            raise ValueError(f"Unsupported time period: {period}")
+    
+    def get_engagement_summary(self) -> Dict:
+        """
+        Get a summary of key engagement metrics.
+        
+        Returns:
+            Dictionary with summary statistics
+        """
+        summary = {}
         
         # Overall CTR
-        total_queries = len(df)
-        queries_with_clicks = df['has_clicks'].sum()
-        overall_ctr = queries_with_clicks / total_queries if total_queries > 0 else 0
+        total_searches = len(self.search_events)
+        searches_with_clicks = self.click_events.groupby(
+            ['session_id', 'query_index_in_session']
+        ).size().shape[0]
+        summary['overall_ctr'] = searches_with_clicks / total_searches if total_searches > 0 else 0
         
-        # Calculate 95% confidence interval for CTR
-        if total_queries > 0:
-            ctr_ci = stats.binom.interval(0.95, total_queries, overall_ctr)
-            ctr_ci = (ctr_ci[0] / total_queries, ctr_ci[1] / total_queries)
+        # Average time to click
+        if not self.click_events.empty:
+            merged_data = self.search_events.merge(
+                self.click_events,
+                on=['session_id', 'query_index_in_session'],
+                suffixes=('_search', '_click')
+            )
+            time_to_click = (
+                merged_data['timestamp_click'] - merged_data['timestamp_search']
+            ).dt.total_seconds()
+            summary['avg_time_to_click'] = time_to_click.mean()
         else:
-            ctr_ci = (0, 0)
+            summary['avg_time_to_click'] = None
         
-        # CTR by day
-        df['date'] = pd.to_datetime(df['timestamp']).dt.date
-        daily_ctr = df.groupby('date').apply(
-            lambda x: (
-                x['has_clicks'].sum() / len(x) if len(x) > 0 else 0,
-                len(x)  # Include count for confidence interval calculation
-            )
-        ).reset_index()
-        daily_ctr.columns = ['date', 'ctr_and_count']
-        daily_ctr['ctr'] = daily_ctr['ctr_and_count'].apply(lambda x: x[0])
-        daily_ctr['count'] = daily_ctr['ctr_and_count'].apply(lambda x: x[1])
-        
-        # Add confidence intervals to daily CTR
-        daily_ctr['ctr_ci_lower'] = daily_ctr.apply(
-            lambda row: stats.binom.interval(0.95, row['count'], row['ctr'])[0] / row['count'] 
-            if row['count'] > 0 else 0, 
-            axis=1
-        )
-        daily_ctr['ctr_ci_upper'] = daily_ctr.apply(
-            lambda row: stats.binom.interval(0.95, row['count'], row['ctr'])[1] / row['count'] 
-            if row['count'] > 0 else 0, 
-            axis=1
-        )
-        
-        daily_ctr = daily_ctr.drop('ctr_and_count', axis=1)
-        
-        # CTR by device type
-        device_ctr = df.groupby('device_type').apply(
-            lambda x: (
-                x['has_clicks'].sum() / len(x) if len(x) > 0 else 0,
-                len(x)
-            )
-        ).reset_index()
-        device_ctr.columns = ['device_type', 'ctr_and_count']
-        device_ctr['ctr'] = device_ctr['ctr_and_count'].apply(lambda x: x[0])
-        device_ctr['count'] = device_ctr['ctr_and_count'].apply(lambda x: x[1])
-        
-        # Add confidence intervals to device CTR
-        device_ctr['ctr_ci_lower'] = device_ctr.apply(
-            lambda row: stats.binom.interval(0.95, row['count'], row['ctr'])[0] / row['count'] 
-            if row['count'] > 0 else 0, 
-            axis=1
-        )
-        device_ctr['ctr_ci_upper'] = device_ctr.apply(
-            lambda row: stats.binom.interval(0.95, row['count'], row['ctr'])[1] / row['count'] 
-            if row['count'] > 0 else 0, 
-            axis=1
-        )
-        
-        device_ctr = device_ctr.drop('ctr_and_count', axis=1)
-        
-        # CTR by query type
-        query_type_ctr = df.groupby('query_type').apply(
-            lambda x: (
-                x['has_clicks'].sum() / len(x) if len(x) > 0 else 0,
-                len(x)
-            )
-        ).reset_index()
-        query_type_ctr.columns = ['query_type', 'ctr_and_count']
-        query_type_ctr['ctr'] = query_type_ctr['ctr_and_count'].apply(lambda x: x[0])
-        query_type_ctr['count'] = query_type_ctr['ctr_and_count'].apply(lambda x: x[1])
-        
-        # Add confidence intervals to query type CTR
-        query_type_ctr['ctr_ci_lower'] = query_type_ctr.apply(
-            lambda row: stats.binom.interval(0.95, row['count'], row['ctr'])[0] / row['count'] 
-            if row['count'] > 0 else 0, 
-            axis=1
-        )
-        query_type_ctr['ctr_ci_upper'] = query_type_ctr.apply(
-            lambda row: stats.binom.interval(0.95, row['count'], row['ctr'])[1] / row['count'] 
-            if row['count'] > 0 else 0, 
-            axis=1
-        )
-        
-        query_type_ctr = query_type_ctr.drop('ctr_and_count', axis=1)
-        
-        # Zero-Click Rate (ZCR)
-        zcr = 1 - overall_ctr
-        zcr_ci = (1 - ctr_ci[1], 1 - ctr_ci[0])  # Invert the CTR CI
-        
-        # Results per click
-        df['results_per_click'] = df.apply(
-            lambda row: len(row['results']) / len(row['clicked_results']) 
-            if isinstance(row['clicked_results'], list) and len(row['clicked_results']) > 0 
-            else np.nan, 
-            axis=1
-        )
-        avg_results_per_click = df['results_per_click'].mean()
-        
-        # Return all metrics
-        return {
-            'overall_ctr': overall_ctr,
-            'ctr_ci': ctr_ci,
-            'daily_ctr': daily_ctr,
-            'device_ctr': device_ctr,
-            'query_type_ctr': query_type_ctr,
-            'zero_click_rate': zcr,
-            'zcr_ci': zcr_ci,
-            'avg_results_per_click': avg_results_per_click
-        }
-    
-    def calculate_time_to_click(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Calculate Time to Click metrics.
-        
-        Args:
-            df: DataFrame containing search log data
-            
-        Returns:
-            Dictionary of Time to Click metrics
-        """
-        logger.info("Calculating Time to Click metrics")
-        
-        # Parse click timestamps if needed
-        if df['click_timestamps'].dtype == 'object' and isinstance(df['click_timestamps'].iloc[0], str):
-            df['click_timestamps'] = df['click_timestamps'].apply(json.loads)
-        
-        # Filter to queries with at least one click
-        click_df = df[df['clicked_results'].apply(lambda x: len(x) > 0 if isinstance(x, list) else False)].copy()
-        
-        if len(click_df) == 0:
-            logger.warning("No clicks found in data, cannot calculate time to click metrics")
-            return {
-                'mean_time_to_first_click': None,
-                'median_time_to_first_click': None,
-                'daily_ttc': pd.DataFrame(),
-                'device_ttc': pd.DataFrame(),
-                'query_type_ttc': pd.DataFrame()
-            }
-        
-        # Calculate time to first click for each query
-        click_df['time_to_first_click'] = click_df.apply(self._calculate_time_to_first_click, axis=1)
-        
-        # Remove outliers
-        if len(click_df) > 0:
-            ttc_threshold = click_df['time_to_first_click'].quantile(self.ttc_outlier_threshold)
-            click_df = click_df[click_df['time_to_first_click'] <= ttc_threshold]
-        
-        # Calculate overall metrics
-        mean_ttc = click_df['time_to_first_click'].mean()
-        median_ttc = click_df['time_to_first_click'].median()
-        
-        # Calculate time to first click by day
-        click_df['date'] = pd.to_datetime(click_df['timestamp']).dt.date
-        daily_ttc = click_df.groupby('date')['time_to_first_click'].agg(['mean', 'median', 'std', 'count']).reset_index()
-        
-        # Add confidence intervals (using t-distribution)
-        daily_ttc['ci_lower'] = daily_ttc.apply(
-            lambda row: row['mean'] - stats.t.ppf(0.975, row['count'] - 1) * row['std'] / np.sqrt(row['count']) 
-            if row['count'] > 1 else row['mean'], 
-            axis=1
-        )
-        daily_ttc['ci_upper'] = daily_ttc.apply(
-            lambda row: row['mean'] + stats.t.ppf(0.975, row['count'] - 1) * row['std'] / np.sqrt(row['count']) 
-            if row['count'] > 1 else row['mean'], 
-            axis=1
-        )
-        
-        # Calculate time to first click by device type
-        device_ttc = click_df.groupby('device_type')['time_to_first_click'].agg(['mean', 'median', 'std', 'count']).reset_index()
-        
-        # Add confidence intervals
-        device_ttc['ci_lower'] = device_ttc.apply(
-            lambda row: row['mean'] - stats.t.ppf(0.975, row['count'] - 1) * row['std'] / np.sqrt(row['count']) 
-            if row['count'] > 1 else row['mean'], 
-            axis=1
-        )
-        device_ttc['ci_upper'] = device_ttc.apply(
-            lambda row: row['mean'] + stats.t.ppf(0.975, row['count'] - 1) * row['std'] / np.sqrt(row['count']) 
-            if row['count'] > 1 else row['mean'], 
-            axis=1
-        )
-        
-        # Calculate time to first click by query type
-        query_type_ttc = click_df.groupby('query_type')['time_to_first_click'].agg(['mean', 'median', 'std', 'count']).reset_index()
-        
-        # Add confidence intervals
-        query_type_ttc['ci_lower'] = query_type_ttc.apply(
-            lambda row: row['mean'] - stats.t.ppf(0.975, row['count'] - 1) * row['std'] / np.sqrt(row['count']) 
-            if row['count'] > 1 else row['mean'], 
-            axis=1
-        )
-        query_type_ttc['ci_upper'] = query_type_ttc.apply(
-            lambda row: row['mean'] + stats.t.ppf(0.975, row['count'] - 1) * row['std'] / np.sqrt(row['count']) 
-            if row['count'] > 1 else row['mean'], 
-            axis=1
-        )
-        
-        # Return all metrics
-        return {
-            'mean_time_to_first_click': mean_ttc,
-            'median_time_to_first_click': median_ttc,
-            'daily_ttc': daily_ttc,
-            'device_ttc': device_ttc,
-            'query_type_ttc': query_type_ttc
-        }
-    
-    def calculate_reformulation_metrics(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Calculate Query Reformulation metrics.
-        
-        Args:
-            df: DataFrame containing search log data
-            
-        Returns:
-            Dictionary of Query Reformulation metrics
-        """
-        logger.info("Calculating Query Reformulation metrics")
-        
-        # Make a copy to avoid modifying the original
-        df_copy = df.copy()
-        
-        # Sort by session_id and timestamp
-        df_copy = df_copy.sort_values(['session_id', 'timestamp'])
-        
-        # Calculate time difference between consecutive queries in the same session
-        df_copy['next_timestamp'] = df_copy.groupby('session_id')['timestamp'].shift(-1)
-        df_copy['time_to_next_query'] = (df_copy['next_timestamp'] - df_copy['timestamp']).dt.total_seconds()
-        
-        # Filter out queries that are the last in their session or where time to next query is > session timeout
-        df_copy = df_copy[
-            (df_copy['time_to_next_query'].notna()) & 
-            (df_copy['time_to_next_query'] <= self.session_timeout)
-        ]
-        
-        # Calculate reformulation rate
-        total_non_last_queries = len(df_copy)
-        reformulation_count = df_copy['is_reformulation'].shift(-1).sum()
-        
-        if total_non_last_queries > 0:
-            reformulation_rate = reformulation_count / total_non_last_queries
+        # Average click position
+        if not self.click_events.empty:
+            summary['avg_click_position'] = self.click_events['click_position'].mean()
+            summary['top_3_click_rate'] = (
+                self.click_events['click_position'] <= 3
+            ).mean()
         else:
-            reformulation_rate = 0
+            summary['avg_click_position'] = None
+            summary['top_3_click_rate'] = None
         
-        # Calculate reformulation rate by day
-        df_copy['date'] = pd.to_datetime(df_copy['timestamp']).dt.date
-        daily_reformulation = df_copy.groupby('date').apply(
-            lambda x: (
-                x['is_reformulation'].shift(-1).sum() / len(x) if len(x) > 0 else 0,
-                len(x)
-            )
-        ).reset_index()
-        daily_reformulation.columns = ['date', 'reform_and_count']
-        daily_reformulation['reformulation_rate'] = daily_reformulation['reform_and_count'].apply(lambda x: x[0])
-        daily_reformulation['count'] = daily_reformulation['reform_and_count'].apply(lambda x: x[1])
-        daily_reformulation = daily_reformulation.drop('reform_and_count', axis=1)
+        # Session metrics
+        session_metrics = self.calculate_session_engagement()
+        if not session_metrics.empty:
+            summary['avg_session_duration'] = session_metrics['session_duration_seconds'].mean()
+            summary['avg_queries_per_session'] = session_metrics['num_queries'].mean()
+            summary['avg_engagement_score'] = session_metrics['engagement_score'].mean()
         
-        # Calculate reformulation rate by device type
-        device_reformulation = df_copy.groupby('device_type').apply(
-            lambda x: (
-                x['is_reformulation'].shift(-1).sum() / len(x) if len(x) > 0 else 0,
-                len(x)
-            )
-        ).reset_index()
-        device_reformulation.columns = ['device_type', 'reform_and_count']
-        device_reformulation['reformulation_rate'] = device_reformulation['reform_and_count'].apply(lambda x: x[0])
-        device_reformulation['count'] = device_reformulation['reform_and_count'].apply(lambda x: x[1])
-        device_reformulation = device_reformulation.drop('reform_and_count', axis=1)
-        
-        # Calculate reformulation rate by query type
-        query_type_reformulation = df_copy.groupby('query_type').apply(
-            lambda x: (
-                x['is_reformulation'].shift(-1).sum() / len(x) if len(x) > 0 else 0,
-                len(x)
-            )
-        ).reset_index()
-        query_type_reformulation.columns = ['query_type', 'reform_and_count']
-        query_type_reformulation['reformulation_rate'] = query_type_reformulation['reform_and_count'].apply(lambda x: x[0])
-        query_type_reformulation['count'] = query_type_reformulation['reform_and_count'].apply(lambda x: x[1])
-        query_type_reformulation = query_type_reformulation.drop('reform_and_count', axis=1)
-        
-        # Return all metrics
-        return {
-            'overall_reformulation_rate': reformulation_rate,
-            'daily_reformulation': daily_reformulation,
-            'device_reformulation': device_reformulation,
-            'query_type_reformulation': query_type_reformulation
-        }
-    
-    def calculate_session_metrics(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Calculate Session-level metrics.
-        
-        Args:
-            df: DataFrame containing search log data
-            
-        Returns:
-            Dictionary of Session metrics
-        """
-        logger.info("Calculating Session metrics")
-        
-        # Group by session_id
-        session_groups = df.groupby('session_id')
-        
-        session_data = []
-        
-        for session_id, session_df in session_groups:
-            # Sort by timestamp within session
-            session_df = session_df.sort_values('timestamp')
-            
-            # Basic session metrics
-            start_time = session_df['timestamp'].min()
-            end_time = session_df['timestamp'].max()
-            duration = (end_time - start_time).total_seconds()
-            
-            # User and device info
-            user_id = session_df['user_id'].iloc[0]
-            device_type = session_df['device_type'].iloc[0]
-            location = session_df['location'].iloc[0]
-            
-            # Query and click counts
-            num_queries = len(session_df)
-            
-            # Calculate total clicks in session
-            if 'clicked_results' in session_df.columns:
-                if isinstance(session_df['clicked_results'].iloc[0], str):
-                    total_clicks = session_df['clicked_results'].apply(
-                        lambda x: len(json.loads(x)) if x else 0
-                    ).sum()
-                else:
-                    total_clicks = session_df['clicked_results'].apply(
-                        lambda x: len(x) if isinstance(x, list) else 0
-                    ).sum()
-            else:
-                total_clicks = session_df['num_clicks'].sum()
-            
-            # Check if session had any clicks
-            has_clicks = total_clicks > 0
-            
-            # Calculate reformulations
-            num_reformulations = session_df['is_reformulation'].sum()
-            
-            # Session success metrics
-            # 1. Has at least one click
-            success_has_click = has_clicks
-            
-            # 2. Last query has a click (didn't abandon)
-            if 'clicked_results' in session_df.columns:
-                if isinstance(session_df['clicked_results'].iloc[-1], str):
-                    last_query_has_click = len(json.loads(session_df['clicked_results'].iloc[-1])) > 0
-                else:
-                    last_query_has_click = (isinstance(session_df['clicked_results'].iloc[-1], list) and 
-                                         len(session_df['clicked_results'].iloc[-1]) > 0)
-            else:
-                last_query_has_click = session_df['num_clicks'].iloc[-1] > 0
-            
-            # 3. Low reformulation ratio
-            reformulation_ratio = num_reformulations / (num_queries - 1) if num_queries > 1 else 0
-            low_reformulation = reformulation_ratio < 0.5  # Threshold
-            
-            # Overall success score (0-3 scale)
-            success_score = sum([
-                success_has_click,
-                last_query_has_click,
-                low_reformulation
-            ])
-            
-            # Add to session data
-            session_record = {
-                'session_id': session_id,
-                'user_id': user_id,
-                'device_type': device_type,
-                'location': location,
-                'start_time': start_time,
-                'end_time': end_time,
-                'duration_seconds': duration,
-                'num_queries': num_queries,
-                'total_clicks': total_clicks,
-                'clicks_per_query': total_clicks / num_queries if num_queries > 0 else 0,
-                'num_reformulations': num_reformulations,
-                'reformulation_ratio': reformulation_ratio,
-                'has_clicks': has_clicks,
-                'last_query_has_click': last_query_has_click,
-                'success_score': success_score,
-                'date': pd.to_datetime(start_time).date()
-            }
-            
-            session_data.append(session_record)
-        
-        # Create session DataFrame
-        sessions_df = pd.DataFrame(session_data)
-        
-        # Calculate overall session metrics
-        total_sessions = len(sessions_df)
-        
-        # Abandonment rate (sessions with no clicks)
-        abandonment_count = (~sessions_df['has_clicks']).sum()
-        abandonment_rate = abandonment_count / total_sessions if total_sessions > 0 else 0
-        
-        # Success rate (sessions with success score >= 2)
-        success_count = (sessions_df['success_score'] >= 2).sum()
-        success_rate = success_count / total_sessions if total_sessions > 0 else 0
-        
-        # Average queries per session
-        avg_queries_per_session = sessions_df['num_queries'].mean()
-        
-        # Average session duration
-        avg_session_duration = sessions_df['duration_seconds'].mean()
-        
-        # Single-query session rate
-        single_query_count = (sessions_df['num_queries'] == 1).sum()
-        single_query_rate = single_query_count / total_sessions if total_sessions > 0 else 0
-        
-        # Daily metrics
-        daily_session_metrics = sessions_df.groupby('date').agg({
-            'session_id': 'count',
-            'has_clicks': lambda x: (~x).mean(),  # Abandonment rate
-            'success_score': lambda x: (x >= 2).mean(),  # Success rate
-            'num_queries': 'mean',  # Avg queries per session
-            'duration_seconds': 'mean',  # Avg session duration
-        }).reset_index()
-        
-        daily_session_metrics.columns = [
-            'date', 'num_sessions', 'abandonment_rate', 'success_rate', 
-            'avg_queries_per_session', 'avg_duration'
-        ]
-        
-        # Device metrics
-        device_session_metrics = sessions_df.groupby('device_type').agg({
-            'session_id': 'count',
-            'has_clicks': lambda x: (~x).mean(),  # Abandonment rate
-            'success_score': lambda x: (x >= 2).mean(),  # Success rate
-            'num_queries': 'mean',  # Avg queries per session
-            'duration_seconds': 'mean',  # Avg session duration
-        }).reset_index()
-        
-        device_session_metrics.columns = [
-            'device_type', 'num_sessions', 'abandonment_rate', 'success_rate', 
-            'avg_queries_per_session', 'avg_duration'
-        ]
-        
-        # Return all metrics
-        return {
-            'sessions_df': sessions_df,
-            'total_sessions': total_sessions,
-            'abandonment_rate': abandonment_rate,
-            'success_rate': success_rate,
-            'avg_queries_per_session': avg_queries_per_session,
-            'avg_session_duration': avg_session_duration,
-            'single_query_rate': single_query_rate,
-            'daily_session_metrics': daily_session_metrics,
-            'device_session_metrics': device_session_metrics
-        }
-    
-    def _calculate_time_to_first_click(self, row):
-        """Helper method to calculate time to first click in seconds."""
-        # Parse timestamps if they're in string format
-        click_timestamps = row['click_timestamps']
-        if isinstance(click_timestamps, str):
-            click_timestamps = json.loads(click_timestamps)
-        
-        # If no clicks, return None
-        if not click_timestamps or len(click_timestamps) == 0:
-            return None
-        
-        # Get first click timestamp
-        first_click_time = pd.to_datetime(click_timestamps[0])
-        query_time = row['timestamp']
-        
-        # Calculate time difference in seconds
-        time_diff = (first_click_time - query_time).total_seconds()
-        
-        # Apply maximum time constraint
-        if time_diff > self.max_time_to_click or time_diff < 0:
-            return None
-        
-        return time_diff
+        return summary
 
-    def calculate_all_metrics(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Calculate all engagement metrics.
-        
-        Args:
-            df: DataFrame containing search log data
-            
-        Returns:
-            Dictionary of all engagement metrics
-        """
-        logger.info("Calculating all engagement metrics")
-        
-        # Calculate individual metric sets
-        ctr_metrics = self.calculate_ctr(df)
-        time_to_click_metrics = self.calculate_time_to_click(df)
-        reformulation_metrics = self.calculate_reformulation_metrics(df)
-        session_metrics = self.calculate_session_metrics(df)
-        
-        # Combine all metrics
-        all_metrics = {
-            'ctr': ctr_metrics,
-            'time_to_click': time_to_click_metrics,
-            'reformulation': reformulation_metrics,
-            'session': session_metrics
-        }
-        
-        return all_metrics
+if __name__ == "__main__":
+    # Example usage
+    import sys
+    sys.path.append('..')
+    from data.data_generator import SearchDataGenerator
+    
+    # Generate sample data
+    generator = SearchDataGenerator(seed=42)
+    data = generator.generate_search_logs(num_sessions=100)
+    
+    # Calculate engagement metrics
+    engagement = EngagementMetrics(data)
+    
+    # Get various metrics
+    ctr_metrics = engagement.calculate_click_through_rate(
+        groupby_cols=['user_segment'], 
+        time_period='daily'
+    )
+    print("CTR Metrics:")
+    print(ctr_metrics.head())
+    
+    # Get summary
+    summary = engagement.get_engagement_summary()
+    print("\nEngagement Summary:")
+    for key, value in summary.items():
+        print(f"  {key}: {value}")

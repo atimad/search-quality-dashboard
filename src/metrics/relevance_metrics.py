@@ -1,480 +1,309 @@
 """
-Relevance Metrics for Search Quality Dashboard.
+Relevance metrics module for search quality analysis.
 
-This module calculates relevance metrics from search log data, including:
-- Mean Reciprocal Rank (MRR)
-- Normalized Discounted Cumulative Gain (NDCG)
-- Precision@k
-- Click Position Distribution
+This module provides functions to calculate various relevance metrics for search queries,
+including user satisfaction, ranking quality, and reformulation patterns.
 """
 
-import pandas as pd
 import numpy as np
-from typing import Dict, List, Tuple, Any, Optional
-import logging
-import json
-from scipy import stats
+import pandas as pd
+from typing import Dict, List, Tuple, Union, Optional
 
-# Set up logging
-logger = logging.getLogger(__name__)
+def calculate_ndcg(clicked_positions: List[int], 
+                  click_satisfaction_scores: Optional[List[float]] = None,
+                  k: int = 10) -> float:
+    """
+    Calculate Normalized Discounted Cumulative Gain (NDCG) for a single query.
+    
+    Args:
+        clicked_positions: List of positions that were clicked (1-indexed)
+        click_satisfaction_scores: Optional list of relevance scores for each click
+        k: Number of positions to consider
+        
+    Returns:
+        NDCG score from 0 to 1
+    """
+    if not clicked_positions:
+        return 0.0
+    
+    # If no satisfaction scores provided, assume all clicks have relevance 1.0
+    if click_satisfaction_scores is None:
+        click_satisfaction_scores = [1.0] * len(clicked_positions)
+    
+    # Calculate DCG
+    dcg = 0.0
+    for pos, score in zip(clicked_positions, click_satisfaction_scores):
+        if pos <= k:  # Only consider positions up to k
+            # DCG formula: relevance / log2(position + 1)
+            dcg += score / np.log2(pos + 1)
+    
+    # Calculate ideal DCG (IDCG)
+    # Sort relevance scores in descending order for ideal ranking
+    ideal_scores = sorted(click_satisfaction_scores, reverse=True)
+    idcg = 0.0
+    for i, score in enumerate(ideal_scores):
+        if i < k:  # Only consider up to k positions
+            idcg += score / np.log2(i + 2)  # i+2 because i is 0-indexed
+    
+    # Avoid division by zero
+    if idcg == 0:
+        return 0.0
+        
+    return dcg / idcg
 
-class RelevanceMetrics:
-    """Calculate relevance metrics from search log data."""
+def calculate_mrr(first_click_positions: List[int]) -> float:
+    """
+    Calculate Mean Reciprocal Rank (MRR) for a set of queries.
     
-    def __init__(self, config: Dict = None):
-        """Initialize with configuration."""
-        self.config = config or {}
-        self.metrics_config = self.config.get('metrics', {})
+    Args:
+        first_click_positions: List of positions of the first click for each query (1-indexed)
         
-        # Configure NDCG settings
-        ndcg_config = self.metrics_config.get('ndcg', {})
-        self.k_values = ndcg_config.get('k_values', [3, 5, 10])
-        
-        # Configure MRR settings
-        mrr_config = self.metrics_config.get('mrr', {})
-        self.consider_no_clicks = mrr_config.get('consider_no_clicks', True)
+    Returns:
+        MRR score from 0 to 1
+    """
+    if not first_click_positions:
+        return 0.0
     
-    def calculate_mrr(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Calculate Mean Reciprocal Rank (MRR) metrics.
-        
-        Args:
-            df: DataFrame containing search log data
-            
-        Returns:
-            Dictionary of MRR metrics
-        """
-        logger.info("Calculating MRR metrics")
-        
-        # Make a copy to avoid modifying the original
-        df_copy = df.copy()
-        
-        # Calculate the reciprocal rank for each query
-        df_copy['reciprocal_rank'] = df_copy.apply(self._calculate_reciprocal_rank, axis=1)
-        
-        # Filter based on configuration
-        if not self.consider_no_clicks:
-            df_copy = df_copy[df_copy['reciprocal_rank'] > 0]
-        
-        # Calculate overall MRR
-        overall_mrr = df_copy['reciprocal_rank'].mean()
-        
-        # Calculate MRR by day
-        df_copy['date'] = pd.to_datetime(df_copy['timestamp']).dt.date
-        daily_mrr = df_copy.groupby('date')['reciprocal_rank'].agg(['mean', 'std', 'count']).reset_index()
-        
-        # Add confidence intervals
-        daily_mrr['ci_lower'] = daily_mrr.apply(
-            lambda row: row['mean'] - stats.t.ppf(0.975, row['count'] - 1) * row['std'] / np.sqrt(row['count']) 
-            if row['count'] > 1 else row['mean'], 
-            axis=1
-        )
-        daily_mrr['ci_upper'] = daily_mrr.apply(
-            lambda row: row['mean'] + stats.t.ppf(0.975, row['count'] - 1) * row['std'] / np.sqrt(row['count']) 
-            if row['count'] > 1 else row['mean'], 
-            axis=1
-        )
-        
-        # Calculate MRR by device type
-        device_mrr = df_copy.groupby('device_type')['reciprocal_rank'].agg(['mean', 'std', 'count']).reset_index()
-        
-        # Add confidence intervals
-        device_mrr['ci_lower'] = device_mrr.apply(
-            lambda row: row['mean'] - stats.t.ppf(0.975, row['count'] - 1) * row['std'] / np.sqrt(row['count']) 
-            if row['count'] > 1 else row['mean'], 
-            axis=1
-        )
-        device_mrr['ci_upper'] = device_mrr.apply(
-            lambda row: row['mean'] + stats.t.ppf(0.975, row['count'] - 1) * row['std'] / np.sqrt(row['count']) 
-            if row['count'] > 1 else row['mean'], 
-            axis=1
-        )
-        
-        # Calculate MRR by query type
-        query_type_mrr = df_copy.groupby('query_type')['reciprocal_rank'].agg(['mean', 'std', 'count']).reset_index()
-        
-        # Add confidence intervals
-        query_type_mrr['ci_lower'] = query_type_mrr.apply(
-            lambda row: row['mean'] - stats.t.ppf(0.975, row['count'] - 1) * row['std'] / np.sqrt(row['count']) 
-            if row['count'] > 1 else row['mean'], 
-            axis=1
-        )
-        query_type_mrr['ci_upper'] = query_type_mrr.apply(
-            lambda row: row['mean'] + stats.t.ppf(0.975, row['count'] - 1) * row['std'] / np.sqrt(row['count']) 
-            if row['count'] > 1 else row['mean'], 
-            axis=1
-        )
-        
-        # Return all metrics
-        return {
-            'overall_mrr': overall_mrr,
-            'daily_mrr': daily_mrr,
-            'device_mrr': device_mrr,
-            'query_type_mrr': query_type_mrr
-        }
+    # Calculate reciprocal rank for each query
+    reciprocal_ranks = [1.0/pos if pos > 0 else 0.0 for pos in first_click_positions]
     
-    def calculate_ndcg(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Calculate NDCG metrics.
-        
-        Args:
-            df: DataFrame containing search log data
-            
-        Returns:
-            Dictionary of NDCG metrics
-        """
-        logger.info("Calculating NDCG metrics")
-        
-        # Make a copy to avoid modifying the original
-        df_copy = df.copy()
-        
-        # Calculate NDCG for each k value
-        metrics = {}
-        
-        for k in self.k_values:
-            # Calculate NDCG@k for each query
-            df_copy[f'ndcg_{k}'] = df_copy.apply(lambda row: self._calculate_ndcg_k(row, k), axis=1)
-            
-            # Calculate overall NDCG@k
-            overall_ndcg = df_copy[f'ndcg_{k}'].mean()
-            metrics[f'overall_ndcg_{k}'] = overall_ndcg
-            
-            # Calculate NDCG@k by day
-            df_copy['date'] = pd.to_datetime(df_copy['timestamp']).dt.date
-            daily_ndcg = df_copy.groupby('date')[f'ndcg_{k}'].agg(['mean', 'std', 'count']).reset_index()
-            
-            # Add confidence intervals
-            daily_ndcg['ci_lower'] = daily_ndcg.apply(
-                lambda row: row['mean'] - stats.t.ppf(0.975, row['count'] - 1) * row['std'] / np.sqrt(row['count']) 
-                if row['count'] > 1 else row['mean'], 
-                axis=1
-            )
-            daily_ndcg['ci_upper'] = daily_ndcg.apply(
-                lambda row: row['mean'] + stats.t.ppf(0.975, row['count'] - 1) * row['std'] / np.sqrt(row['count']) 
-                if row['count'] > 1 else row['mean'], 
-                axis=1
-            )
-            
-            metrics[f'daily_ndcg_{k}'] = daily_ndcg
-            
-            # Calculate NDCG@k by device type
-            device_ndcg = df_copy.groupby('device_type')[f'ndcg_{k}'].agg(['mean', 'std', 'count']).reset_index()
-            
-            # Add confidence intervals
-            device_ndcg['ci_lower'] = device_ndcg.apply(
-                lambda row: row['mean'] - stats.t.ppf(0.975, row['count'] - 1) * row['std'] / np.sqrt(row['count']) 
-                if row['count'] > 1 else row['mean'], 
-                axis=1
-            )
-            device_ndcg['ci_upper'] = device_ndcg.apply(
-                lambda row: row['mean'] + stats.t.ppf(0.975, row['count'] - 1) * row['std'] / np.sqrt(row['count']) 
-                if row['count'] > 1 else row['mean'], 
-                axis=1
-            )
-            
-            metrics[f'device_ndcg_{k}'] = device_ndcg
-            
-            # Calculate NDCG@k by query type
-            query_type_ndcg = df_copy.groupby('query_type')[f'ndcg_{k}'].agg(['mean', 'std', 'count']).reset_index()
-            
-            # Add confidence intervals
-            query_type_ndcg['ci_lower'] = query_type_ndcg.apply(
-                lambda row: row['mean'] - stats.t.ppf(0.975, row['count'] - 1) * row['std'] / np.sqrt(row['count']) 
-                if row['count'] > 1 else row['mean'], 
-                axis=1
-            )
-            query_type_ndcg['ci_upper'] = query_type_ndcg.apply(
-                lambda row: row['mean'] + stats.t.ppf(0.975, row['count'] - 1) * row['std'] / np.sqrt(row['count']) 
-                if row['count'] > 1 else row['mean'], 
-                axis=1
-            )
-            
-            metrics[f'query_type_ndcg_{k}'] = query_type_ndcg
-        
-        return metrics
+    # Calculate mean
+    return np.mean(reciprocal_ranks)
+
+def calculate_query_success_rate(df: pd.DataFrame) -> float:
+    """
+    Calculate the query success rate - proportion of queries that result in at least one click.
     
-    def calculate_precision_at_k(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Calculate Precision@k metrics.
+    Args:
+        df: DataFrame containing search session data with 'query_id' and 'clicked' columns
         
-        Args:
-            df: DataFrame containing search log data
-            
-        Returns:
-            Dictionary of Precision@k metrics
-        """
-        logger.info("Calculating Precision@k metrics")
-        
-        # Make a copy to avoid modifying the original
-        df_copy = df.copy()
-        
-        # Calculate Precision@k for each k value
-        metrics = {}
-        
-        for k in self.k_values:
-            # Calculate Precision@k for each query
-            df_copy[f'precision_{k}'] = df_copy.apply(lambda row: self._calculate_precision_k(row, k), axis=1)
-            
-            # Calculate overall Precision@k
-            overall_precision = df_copy[f'precision_{k}'].mean()
-            metrics[f'overall_precision_{k}'] = overall_precision
-            
-            # Calculate Precision@k by day
-            df_copy['date'] = pd.to_datetime(df_copy['timestamp']).dt.date
-            daily_precision = df_copy.groupby('date')[f'precision_{k}'].agg(['mean', 'std', 'count']).reset_index()
-            
-            # Add confidence intervals
-            daily_precision['ci_lower'] = daily_precision.apply(
-                lambda row: row['mean'] - stats.t.ppf(0.975, row['count'] - 1) * row['std'] / np.sqrt(row['count']) 
-                if row['count'] > 1 else row['mean'], 
-                axis=1
-            )
-            daily_precision['ci_upper'] = daily_precision.apply(
-                lambda row: row['mean'] + stats.t.ppf(0.975, row['count'] - 1) * row['std'] / np.sqrt(row['count']) 
-                if row['count'] > 1 else row['mean'], 
-                axis=1
-            )
-            
-            metrics[f'daily_precision_{k}'] = daily_precision
-            
-            # Calculate Precision@k by device type
-            device_precision = df_copy.groupby('device_type')[f'precision_{k}'].agg(['mean', 'std', 'count']).reset_index()
-            
-            # Add confidence intervals
-            device_precision['ci_lower'] = device_precision.apply(
-                lambda row: row['mean'] - stats.t.ppf(0.975, row['count'] - 1) * row['std'] / np.sqrt(row['count']) 
-                if row['count'] > 1 else row['mean'], 
-                axis=1
-            )
-            device_precision['ci_upper'] = device_precision.apply(
-                lambda row: row['mean'] + stats.t.ppf(0.975, row['count'] - 1) * row['std'] / np.sqrt(row['count']) 
-                if row['count'] > 1 else row['mean'], 
-                axis=1
-            )
-            
-            metrics[f'device_precision_{k}'] = device_precision
-            
-            # Calculate Precision@k by query type
-            query_type_precision = df_copy.groupby('query_type')[f'precision_{k}'].agg(['mean', 'std', 'count']).reset_index()
-            
-            # Add confidence intervals
-            query_type_precision['ci_lower'] = query_type_precision.apply(
-                lambda row: row['mean'] - stats.t.ppf(0.975, row['count'] - 1) * row['std'] / np.sqrt(row['count']) 
-                if row['count'] > 1 else row['mean'], 
-                axis=1
-            )
-            query_type_precision['ci_upper'] = query_type_precision.apply(
-                lambda row: row['mean'] + stats.t.ppf(0.975, row['count'] - 1) * row['std'] / np.sqrt(row['count']) 
-                if row['count'] > 1 else row['mean'], 
-                axis=1
-            )
-            
-            metrics[f'query_type_precision_{k}'] = query_type_precision
-        
-        return metrics
+    Returns:
+        Success rate from 0 to 1
+    """
+    # Group by query_id and check if there was at least one click
+    query_success = df.groupby('query_id')['clicked'].any()
     
-    def calculate_click_position_distribution(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Calculate click position distribution metrics.
+    # Calculate the proportion of successful queries
+    return query_success.mean()
+
+def calculate_reformulation_metrics(df: pd.DataFrame) -> Dict[str, float]:
+    """
+    Calculate metrics related to query reformulations.
+    
+    Args:
+        df: DataFrame containing search session data with 'session_id', 'query_id', 
+            'query_text', 'clicked', and 'timestamp' columns
         
-        Args:
-            df: DataFrame containing search log data
-            
-        Returns:
-            Dictionary of click position distribution metrics
-        """
-        logger.info("Calculating click position distribution metrics")
+    Returns:
+        Dictionary of reformulation metrics
+    """
+    # Group data by session
+    sessions = df.sort_values(['session_id', 'timestamp']).groupby('session_id')
+    
+    # Calculate metrics
+    results = {}
+    
+    # 1. Average number of queries per session
+    results['avg_queries_per_session'] = sessions['query_id'].nunique().mean()
+    
+    # 2. Reformulation rate - proportion of sessions with more than one query
+    results['reformulation_rate'] = (sessions['query_id'].nunique() > 1).mean()
+    
+    # 3. Abandonment rate - proportion of sessions where no query resulted in a click
+    results['abandonment_rate'] = (~sessions['clicked'].any()).mean()
+    
+    # 4. Zero-click reformulation rate - proportion of queries followed by another query without a click
+    # Create a helper function to analyze each session
+    def calculate_zero_click_reformulations(group):
+        # Check if query had clicks
+        query_had_clicks = group.groupby('query_id')['clicked'].any()
         
-        # Make a copy to avoid modifying the original
-        df_copy = df.copy()
+        # Count queries without clicks followed by another query
+        zero_click_count = 0
+        total_queries = len(query_had_clicks)
         
-        # Ensure clicked_results is properly parsed
-        if 'clicked_results' in df_copy.columns and isinstance(df_copy['clicked_results'].iloc[0], str):
-            df_copy['clicked_results'] = df_copy['clicked_results'].apply(json.loads)
+        if total_queries <= 1:
+            return 0
         
-        # Ensure results is properly parsed
-        if 'results' in df_copy.columns and isinstance(df_copy['results'].iloc[0], str):
-            df_copy['results'] = df_copy['results'].apply(json.loads)
+        # Iterate through all except the last query
+        for i in range(total_queries-1):
+            if not query_had_clicks.iloc[i]:
+                zero_click_count += 1
+                
+        return zero_click_count / (total_queries - 1)  # Denominator excludes last query
+    
+    # Apply helper function to each session
+    zero_click_rates = sessions.apply(calculate_zero_click_reformulations)
+    results['zero_click_reformulation_rate'] = zero_click_rates.mean()
+    
+    return results
+
+def calculate_satisfaction_score(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculate a search satisfaction score for each query based on click behavior.
+    
+    Args:
+        df: DataFrame containing search session data
         
-        # Get all clicked positions
-        all_click_positions = []
+    Returns:
+        DataFrame with satisfaction scores for each query
+    """
+    # Group by query_id
+    query_groups = df.groupby('query_id')
+    
+    # Collect metrics for satisfaction calculation
+    satisfaction_data = []
+    
+    for query_id, group in query_groups:
+        # Basic click metrics
+        click_count = group['clicked'].sum()
+        has_click = click_count > 0
+        clicks_in_top_3 = group[group['position'] <= 3]['clicked'].sum()
         
-        for _, row in df_copy.iterrows():
-            clicked_results = row.get('clicked_results', [])
-            results = row.get('results', [])
-            
-            if not isinstance(clicked_results, list) or not isinstance(results, list):
-                continue
-            
-            # Get positions of clicked results (1-indexed)
-            positions = []
-            for clicked in clicked_results:
-                try:
-                    pos = results.index(clicked) + 1
-                    positions.append(pos)
-                except (ValueError, TypeError):
-                    continue
-            
-            all_click_positions.extend(positions)
+        # Time metrics - dwell time is a good indicator of satisfaction
+        avg_dwell_time = group[group['clicked']]['dwell_time'].mean() if has_click else 0
         
-        # Calculate distribution
-        if all_click_positions:
-            position_counts = pd.Series(all_click_positions).value_counts().sort_index()
-            position_distribution = position_counts / position_counts.sum()
+        # Advanced engagement metrics
+        click_depth = group[group['clicked']]['position'].max() if has_click else 0
+        last_result_clicked = group[group['clicked']]['position'].max() if has_click else 0
+        time_to_first_click = group[group['clicked']]['time_to_click'].min() if has_click else float('inf')
+        
+        # Calculate a composite satisfaction score (0-100)
+        # This is a simplified example - in production, you would want to validate and tune this
+        base_score = 50 if has_click else 20  # Base score
+        
+        # Add points for clicks in top positions
+        position_score = min(25, clicks_in_top_3 * 10)
+        
+        # Add points for longer dwell time (capped at 20 points)
+        dwell_score = min(20, avg_dwell_time / 2) if not np.isnan(avg_dwell_time) else 0
+        
+        # Subtract points for high click depth or slow time to first click
+        depth_penalty = min(10, max(0, (click_depth - 3) * 2)) if click_depth > 0 else 0
+        time_penalty = min(10, max(0, (time_to_first_click - 2) * 2)) if time_to_first_click < float('inf') else 5
+        
+        # Final satisfaction score
+        satisfaction_score = min(100, max(0, base_score + position_score + dwell_score - depth_penalty - time_penalty))
+        
+        # Store the results
+        satisfaction_data.append({
+            'query_id': query_id,
+            'click_count': click_count,
+            'clicks_in_top_3': clicks_in_top_3,
+            'avg_dwell_time': avg_dwell_time,
+            'click_depth': click_depth,
+            'time_to_first_click': time_to_first_click if time_to_first_click < float('inf') else None,
+            'satisfaction_score': satisfaction_score
+        })
+    
+    return pd.DataFrame(satisfaction_data)
+
+def analyze_ranking_quality(df: pd.DataFrame) -> Dict[str, float]:
+    """
+    Analyze the quality of search result rankings.
+    
+    Args:
+        df: DataFrame containing search session data
+        
+    Returns:
+        Dictionary of ranking quality metrics
+    """
+    # Prepare data
+    # We need to know the click positions and possibly satisfaction for each query
+    query_groups = df.groupby('query_id')
+    
+    # Collect data for NDCG and MRR calculation
+    first_click_positions = []
+    all_clicked_positions = []
+    satisfaction_scores = []
+    
+    for query_id, group in query_groups:
+        # Filter for clicked results
+        clicked_results = group[group['clicked']].sort_values('timestamp')
+        
+        if not clicked_results.empty:
+            # Record position of first click (for MRR)
+            first_click_positions.append(clicked_results.iloc[0]['position'])
             
-            # Convert to DataFrame
-            position_df = pd.DataFrame({
-                'position': position_distribution.index,
-                'frequency': position_distribution.values
-            })
+            # Record all clicked positions (for NDCG)
+            positions = clicked_results['position'].tolist()
+            all_clicked_positions.append(positions)
             
-            # Calculate cumulative distribution
-            position_df['cumulative_frequency'] = position_df['frequency'].cumsum()
-            
-            # Get various percentiles
-            p50 = position_df[position_df['cumulative_frequency'] >= 0.5].iloc[0]['position'] if len(position_df[position_df['cumulative_frequency'] >= 0.5]) > 0 else None
-            p75 = position_df[position_df['cumulative_frequency'] >= 0.75].iloc[0]['position'] if len(position_df[position_df['cumulative_frequency'] >= 0.75]) > 0 else None
-            p90 = position_df[position_df['cumulative_frequency'] >= 0.9].iloc[0]['position'] if len(position_df[position_df['cumulative_frequency'] >= 0.9]) > 0 else None
-            
-            return {
-                'position_distribution': position_df,
-                'median_click_position': p50,
-                'p75_click_position': p75,
-                'p90_click_position': p90,
-                'total_clicks': len(all_click_positions)
-            }
+            # Use dwell_time as a proxy for satisfaction/relevance
+            # Normalize to [0, 1] range with a cap at 60 seconds
+            dwell_times = clicked_results['dwell_time'].fillna(0).tolist()
+            normalized_satisfaction = [min(time / 60.0, 1.0) for time in dwell_times]
+            satisfaction_scores.append(normalized_satisfaction)
         else:
-            return {
-                'position_distribution': pd.DataFrame(columns=['position', 'frequency', 'cumulative_frequency']),
-                'median_click_position': None,
-                'p75_click_position': None,
-                'p90_click_position': None,
-                'total_clicks': 0
-            }
+            # No clicks for this query
+            first_click_positions.append(0)  # 0 indicates no click
+            all_clicked_positions.append([])
+            satisfaction_scores.append([])
     
-    def _calculate_reciprocal_rank(self, row):
-        """Calculate reciprocal rank for a single query."""
-        # Parse clicked_results if it's a string
-        clicked_results = row.get('clicked_results', [])
-        if isinstance(clicked_results, str):
-            clicked_results = json.loads(clicked_results)
-        
-        # Parse results if it's a string
-        results = row.get('results', [])
-        if isinstance(results, str):
-            results = json.loads(results)
-        
-        # If no clicks or no results, return 0
-        if not clicked_results or not results:
-            return 0
-        
-        # Get the first clicked result
-        first_clicked = clicked_results[0]
-        
-        # Find its position (1-indexed)
-        try:
-            position = results.index(first_clicked) + 1
-            return 1.0 / position
-        except (ValueError, TypeError):
-            return 0
+    # Calculate metrics
+    results = {}
     
-    def _calculate_ndcg_k(self, row, k):
-        """Calculate NDCG@k for a single query."""
-        # Parse clicked_results if it's a string
-        clicked_results = row.get('clicked_results', [])
-        if isinstance(clicked_results, str):
-            clicked_results = json.loads(clicked_results)
-        
-        # Parse results if it's a string
-        results = row.get('results', [])
-        if isinstance(results, str):
-            results = json.loads(results)
-        
-        # Parse result_relevance if it's a string
-        result_relevance = row.get('result_relevance', {})
-        if isinstance(result_relevance, str):
-            result_relevance = json.loads(result_relevance)
-        
-        # If no results or no relevance scores, return 0
-        if not results or not result_relevance:
-            return 0
-        
-        # Limit to top k results
-        results_k = results[:k]
-        
-        # Get relevance scores for top k results
-        rel_scores = [float(result_relevance.get(r, 0)) for r in results_k]
-        
-        # Get ideal ordering of relevance scores
-        ideal_rel = sorted(rel_scores, reverse=True)
-        
-        # Calculate DCG and IDCG
-        dcg = self._calculate_dcg(rel_scores)
-        idcg = self._calculate_dcg(ideal_rel)
-        
-        # Calculate NDCG
-        if idcg == 0:
-            return 0
-        else:
-            return dcg / idcg
+    # MRR calculation
+    results['mrr'] = calculate_mrr(first_click_positions)
     
-    def _calculate_dcg(self, relevance_scores):
-        """Calculate Discounted Cumulative Gain."""
-        dcg = 0
-        for i, rel in enumerate(relevance_scores):
-            # Use log base 2 for the discount
-            dcg += (2 ** rel - 1) / np.log2(i + 2)  # i+2 because i is 0-indexed and log base 2 of 1 is 0
-        return dcg
+    # NDCG calculation - need to calculate for each query then average
+    ndcg_scores = []
+    for positions, scores in zip(all_clicked_positions, satisfaction_scores):
+        if positions:  # Only calculate for queries with clicks
+            ndcg_scores.append(calculate_ndcg(positions, scores))
     
-    def _calculate_precision_k(self, row, k):
-        """Calculate Precision@k for a single query."""
-        # Parse clicked_results if it's a string
-        clicked_results = row.get('clicked_results', [])
-        if isinstance(clicked_results, str):
-            clicked_results = json.loads(clicked_results)
-        
-        # Parse results if it's a string
-        results = row.get('results', [])
-        if isinstance(results, str):
-            results = json.loads(results)
-        
-        # If no results or no clicks, return 0
-        if not results or not clicked_results:
-            return 0
-        
-        # Limit to top k results
-        results_k = results[:k]
-        
-        # Count clicked results in top k
-        clicked_in_top_k = sum(1 for r in clicked_results if r in results_k)
-        
-        # Calculate precision
-        return clicked_in_top_k / k
+    results['ndcg'] = np.mean(ndcg_scores) if ndcg_scores else 0.0
+    
+    # Additional metrics
+    results['successful_query_rate'] = calculate_query_success_rate(df)
+    
+    # Calculate average click position (lower is better)
+    clicked_df = df[df['clicked']]
+    results['avg_click_position'] = clicked_df['position'].mean() if not clicked_df.empty else 0
+    
+    # Calculate rate of clicks on first result
+    results['first_position_ctr'] = df[df['position'] == 1]['clicked'].mean()
+    
+    return results
 
-    def calculate_all_metrics(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Calculate all relevance metrics.
+def compare_relevance_metrics(baseline_df: pd.DataFrame, 
+                             experiment_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compare relevance metrics between baseline and experiment data.
+    Useful for A/B test analysis.
+    
+    Args:
+        baseline_df: DataFrame containing baseline search data
+        experiment_df: DataFrame containing experiment search data
         
-        Args:
-            df: DataFrame containing search log data
-            
-        Returns:
-            Dictionary of all relevance metrics
-        """
-        logger.info("Calculating all relevance metrics")
+    Returns:
+        DataFrame with metric comparisons
+    """
+    # Calculate metrics for both datasets
+    baseline_metrics = analyze_ranking_quality(baseline_df)
+    experiment_metrics = analyze_ranking_quality(experiment_df)
+    
+    # Calculate reformulation metrics
+    baseline_reformulation = calculate_reformulation_metrics(baseline_df)
+    experiment_reformulation = calculate_reformulation_metrics(experiment_df)
+    
+    # Combine all metrics
+    baseline_metrics.update(baseline_reformulation)
+    experiment_metrics.update(experiment_reformulation)
+    
+    # Create comparison dataframe
+    comparison = []
+    for metric, baseline_value in baseline_metrics.items():
+        experiment_value = experiment_metrics.get(metric, 0)
+        abs_diff = experiment_value - baseline_value
+        rel_diff = abs_diff / baseline_value * 100 if baseline_value != 0 else float('inf')
         
-        # Calculate individual metric sets
-        mrr_metrics = self.calculate_mrr(df)
-        ndcg_metrics = self.calculate_ndcg(df)
-        precision_metrics = self.calculate_precision_at_k(df)
-        click_position_metrics = self.calculate_click_position_distribution(df)
-        
-        # Combine all metrics
-        all_metrics = {
-            'mrr': mrr_metrics,
-            'ndcg': ndcg_metrics,
-            'precision': precision_metrics,
-            'click_position': click_position_metrics
-        }
-        
-        return all_metrics
+        comparison.append({
+            'metric': metric,
+            'baseline': baseline_value,
+            'experiment': experiment_value,
+            'absolute_diff': abs_diff,
+            'relative_diff_percent': rel_diff
+        })
+    
+    return pd.DataFrame(comparison)
